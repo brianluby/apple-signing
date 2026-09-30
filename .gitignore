@@ -1,0 +1,6 @@
+*.p12
+*.p8
+*.key
+*.pem
+.env*
+__pycache__/

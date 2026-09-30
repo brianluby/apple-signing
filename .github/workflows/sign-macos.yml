@@ -1,0 +1,190 @@
+name: Sign and notarize macOS archive
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        required: true
+        type: string
+      archive-name:
+        required: true
+        type: string
+      binary-path:
+        description: Relative executable path inside the tar.gz archive
+        required: true
+        type: string
+      signing-identity:
+        type: string
+        default: "Developer ID Application: Brian Luby (DVH6X33J83)"
+      team-id:
+        type: string
+        default: DVH6X33J83
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    # Signing is a release operation. PR events never receive signing access.
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: macos-14
+    timeout-minutes: 35
+    # This environment belongs to the CALLER repository. Protect it there.
+    environment: release-signing
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARCHIVE_NAME: ${{ inputs.archive-name }}
+      BINARY_PATH: ${{ inputs.binary-path }}
+      SIGNING_IDENTITY: ${{ inputs.signing-identity }}
+      APPLE_TEAM_ID: ${{ inputs.team-id }}
+    steps:
+      - name: Set temporary paths
+        run: echo "WORK=$RUNNER_TEMP/apple-signing" >> "$GITHUB_ENV"
+
+      - name: Download build from this run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/apple-signing/input
+
+      - name: Validate and unpack archive
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import os, pathlib, re, tarfile
+          work = pathlib.Path(os.environ['WORK'])
+          archive = os.environ['ARCHIVE_NAME']
+          binary = pathlib.PurePosixPath(os.environ['BINARY_PATH'])
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz', archive):
+              raise SystemExit('archive-name must be a tar.gz basename')
+          if binary.is_absolute() or '..' in binary.parts or len(binary.parts) < 2:
+              raise SystemExit('binary-path must be below a package directory')
+          payload = work / 'payload'
+          payload.mkdir()
+          with tarfile.open(work / 'input' / archive, 'r:gz') as source:
+              members = source.getmembers()
+              if len(members) > 10000 or sum(m.size for m in members) > 2 * 1024**3:
+                  raise SystemExit('Archive exceeds signing limits')
+              names = set()
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  if (path.is_absolute() or '..' in path.parts or not path.parts
+                          or path.parts[0] != binary.parts[0]
+                          or not (member.isfile() or member.isdir())
+                          or member.name in names):
+                      raise SystemExit('Archive must contain one package, regular files/directories only')
+                  names.add(member.name)
+              source.extractall(payload, members=members)
+          executable = payload / str(binary)
+          if not executable.is_file() or not os.access(executable, os.X_OK):
+              raise SystemExit('binary-path is not an executable regular file')
+          (work / 'output').mkdir()
+          (work / 'logs').mkdir()
+          PYTHON
+
+      - name: Import signing identity and notarization credentials
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          : "${APPLE_CERTIFICATE_P12_BASE64:?Missing signing certificate secret}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?Missing certificate password secret}"
+          : "${APPLE_ID:?Missing Apple account secret}"
+          : "${APPLE_APP_SPECIFIC_PASSWORD:?Missing notarization password secret}"
+          keychain="$WORK/signing.keychain-db"
+          keychain_password=$(openssl rand -hex 32)
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$WORK/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 1800 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$WORK/certificate.p12" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+          # Keep Apple's preinstalled intermediates in the search list.
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          xcrun notarytool store-credentials ci-notary --keychain "$keychain" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD"
+          rm -f "$WORK/certificate.p12"
+
+      - name: Sign executable
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp --options runtime \
+            --keychain "$WORK/signing.keychain-db" \
+            --sign "$SIGNING_IDENTITY" "$WORK/payload/$BINARY_PATH"
+          codesign --verify --strict --verbose=2 "$WORK/payload/$BINARY_PATH"
+          codesign --display --verbose=4 "$WORK/payload/$BINARY_PATH" 2> "$WORK/logs/signature.txt"
+          python3 - <<'PYTHON'
+          import os, pathlib
+          text = (pathlib.Path(os.environ['WORK']) / 'logs/signature.txt').read_text()
+          if 'TeamIdentifier=' + os.environ['APPLE_TEAM_ID'] + '\n' not in text:
+              raise SystemExit('Signing team does not match requested team')
+          PYTHON
+
+      - name: Submit to Apple and require acceptance
+        run: |
+          set -euo pipefail
+          ditto -c -k "$WORK/payload" "$WORK/submission.zip"
+          xcrun notarytool submit "$WORK/submission.zip" \
+            --keychain-profile ci-notary --keychain "$WORK/signing.keychain-db" \
+            --wait --timeout 20m --output-format json --no-progress > "$WORK/logs/submission.json"
+          python3 - <<'PYTHON'
+          import json, os, pathlib, subprocess
+          work = pathlib.Path(os.environ['WORK'])
+          result = json.loads((work / 'logs/submission.json').read_text())
+          if result.get('id'):
+              subprocess.run(['xcrun', 'notarytool', 'log', result['id'],
+                  '--keychain-profile', 'ci-notary', '--keychain', str(work / 'signing.keychain-db'),
+                  str(work / 'logs/notarization.json')], check=True)
+          if result.get('status') != 'Accepted':
+              raise SystemExit('Apple did not accept the archive; publication blocked')
+          print('Apple accepted submission', result['id'])
+          PYTHON
+          codesign --verify --strict --check-notarization -R=notarized \
+            "$WORK/payload/$BINARY_PATH"
+
+      - name: Package exact notarized executable and checksum
+        run: |
+          set -euo pipefail
+          package="${BINARY_PATH%%/*}"
+          tar -C "$WORK/payload" -czf "$WORK/output/$ARCHIVE_NAME" "$package"
+          (cd "$WORK/output" && shasum -a 256 "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256")
+          # Mach-O command-line tools cannot carry stapled tickets. macOS
+          # retrieves their notarization ticket online by the signature digest.
+
+      - name: Replace unsigned artifact with signed release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/apple-signing/output/*
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Save signing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-notarization-${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/apple-signing/logs/*
+          if-no-files-found: ignore
+
+      - name: Remove temporary credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          keychain="$WORK/signing.keychain-db"
+          if [ -f "$keychain" ]; then
+            security delete-keychain "$keychain"
+          fi
+          rm -f "$WORK/certificate.p12"
